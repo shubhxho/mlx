@@ -48,6 +48,40 @@ The design of MLX is inspired by frameworks like
 [PyTorch](https://pytorch.org/), [Jax](https://github.com/google/jax), and
 [ArrayFire](https://arrayfire.org/).
 
+## Benchmarks (this fork: `perf/cpu`)
+
+> This fork's `perf/cpu` branch speeds up the **CPU backend** (Linux, x86).
+> Measured on an 8 vCPU Intel Xeon VM (320 MiB L3, no GPU), GCC 13, upstream
+> `96fbf67` vs `perf/cpu`. These are median times per call over 15 rounds of
+> 10 calls. Metal / Apple Silicon were not measured. Full method, all ops,
+> single-thread numbers and limits are in [PERF.md](PERF.md) and
+> [docs/mlx-cpu-perf.pdf](docs/mlx-cpu-perf.pdf).
+
+| Op (float32) | Upstream (ms) | perf/cpu (ms) | Speedup |
+|---|---:|---:|---:|
+| add f32 4096x4096 | 25.48 | 7.33 | 3.5x |
+| add bcast row 4096x4096 | 22.57 | 6.65 | 3.4x |
+| exp f32 4096x4096 | 258.69 | 9.81 | 26.4x |
+| tanh f32 4096x4096 | 96.78 | 16.07 | 6.0x |
+| where 4096x4096 | 111.50 | 15.86 | 7.0x |
+| sum all 4096x4096 | 8.74 | 0.44 | 19.9x |
+| sum axis=0 4096x4096 | 2.80 | 1.19 | 2.3x |
+| max axis=-1 4096x4096 | 17.13 | 0.82 | 20.8x |
+| softmax f32 4096x4096 | 277.83 | 12.94 | 21.5x |
+| softmax f32 8x32x512x512 | 1093.90 | 50.26 | 21.8x |
+| rms_norm 4096x4096 | 59.79 | 16.57 | 3.6x |
+| layer_norm 4096x4096 | 109.27 | 25.79 | 4.2x |
+| transpose copy 4096x4096 | 184.50 | 9.41 | 19.6x |
+| swapaxes copy 8x32x512x512 | 170.87 | 32.97 | 5.2x |
+| sort axis=-1 1024x4096 | 204.78 | 27.63 | 7.4x |
+| argsort axis=-1 1024x4096 | 245.35 | 33.24 | 7.4x |
+| gather rows 4096 of 32000x1024 | 1.28 | 1.24 | 1.0x |
+
+![CPU speedups](docs/perf/cpu_speedup.png)
+
+`gather` was not changed and is shown as a control. Reproduce with
+`python benchmarks/python/cpu_ops_bench.py` (see PERF.md).
+
 ## Examples
 
 The [MLX examples repo](https://github.com/ml-explore/mlx-examples) has a
