@@ -3,10 +3,12 @@
 #include <cassert>
 #include <functional>
 #include <limits>
+#include <memory>
 
 #include "mlx/backend/common/reduce.h"
 #include "mlx/backend/cpu/encoder.h"
 #include "mlx/backend/cpu/simd/simd.h"
+#include "mlx/backend/cpu/threading.h"
 #include "mlx/primitives.h"
 
 namespace mlx::core {
@@ -169,6 +171,30 @@ void reduction_op(
   auto in_ptr = x.data<T>();
   auto out_ptr = out.data<U>();
   if (plan.type == ContiguousAllReduce) {
+    int64_t size = x.size();
+    int nt = cpu::max_threads();
+    int64_t grain = cpu::elementwise_grain<T>();
+    if (nt > 1 && size >= 2 * grain) {
+      // Reduce fixed-size chunks in parallel, then combine the partial
+      // results in order.
+      int64_t n_parts = std::min<int64_t>(nt, size / grain);
+      // Not std::vector<U> since U may be bool.
+      std::unique_ptr<U[]> partial(new U[n_parts]);
+      std::fill_n(partial.get(), n_parts, init);
+      cpu::parallel_for(n_parts, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t p = begin; p < end; p++) {
+          int64_t s = size * p / n_parts;
+          int64_t e = size * (p + 1) / n_parts;
+          contiguous_reduce(in_ptr + s, &partial[p], e - s, Op{}, init);
+        }
+      });
+      U val = init;
+      for (int64_t p = 0; p < n_parts; p++) {
+        val = Op{}(val, partial[p]);
+      }
+      *out_ptr = val;
+      return;
+    }
     *out_ptr = init;
     contiguous_reduce(in_ptr, out_ptr, x.size(), Op{}, init);
     return;
@@ -176,10 +202,15 @@ void reduction_op(
 
   if (plan.type == ContiguousReduce && plan.shape.size() == 1) {
     int reduction_size = plan.shape[0];
-    for (int i = 0; i < out.size(); i++, out_ptr++, in_ptr += reduction_size) {
-      *out_ptr = init;
-      contiguous_reduce(in_ptr, out_ptr, reduction_size, Op{}, init);
-    }
+    int64_t grain = std::max<int64_t>(
+        cpu::elementwise_grain<T>() / std::max(reduction_size, 1), 1);
+    cpu::parallel_for(out.size(), grain, [&](int64_t begin, int64_t end) {
+      auto x_ptr = in_ptr + begin * reduction_size;
+      for (int64_t i = begin; i < end; i++, x_ptr += reduction_size) {
+        out_ptr[i] = init;
+        contiguous_reduce(x_ptr, out_ptr + i, reduction_size, Op{}, init);
+      }
+    });
     return;
   }
 
@@ -221,12 +252,37 @@ void reduction_op(
     size_t reduction_stride = plan.strides.back();
     plan.shape.pop_back();
     plan.strides.pop_back();
-    for (int i = 0; i < out.size(); i += reduction_stride) {
-      std::fill_n(out_ptr, reduction_stride, init);
-      strided_reduce(in_ptr, out_ptr, reduction_size, reduction_stride, Op{});
-      in_ptr += reduction_stride * reduction_size;
-      out_ptr += reduction_stride;
+    int64_t n_outer = out.size() / reduction_stride;
+    int64_t work = int64_t(reduction_size) * reduction_stride;
+    if (n_outer == 1 && reduction_stride >= 2 * 16) {
+      // A single (large) strided reduction: split the columns across
+      // threads. Each thread reduces all rows for its range of columns.
+      int64_t grain = std::max<int64_t>(
+          cpu::elementwise_grain<T>() / std::max(reduction_size, 1), 16);
+      cpu::parallel_for(
+          reduction_stride, grain, [&](int64_t begin, int64_t end) {
+            std::fill(out_ptr + begin, out_ptr + end, init);
+            for (int r = 0; r < reduction_size; r++) {
+              strided_reduce(
+                  in_ptr + r * reduction_stride + begin,
+                  out_ptr + begin,
+                  1,
+                  end - begin,
+                  Op{});
+            }
+          });
+      return;
     }
+    int64_t grain = std::max<int64_t>(
+        cpu::elementwise_grain<T>() / std::max<int64_t>(work, 1), 1);
+    cpu::parallel_for(n_outer, grain, [&](int64_t begin, int64_t end) {
+      for (int64_t o = begin; o < end; o++) {
+        auto o_ptr = out_ptr + o * reduction_stride;
+        std::fill_n(o_ptr, reduction_stride, init);
+        strided_reduce(
+            in_ptr + o * work, o_ptr, reduction_size, reduction_stride, Op{});
+      }
+    });
     return;
   }
 
