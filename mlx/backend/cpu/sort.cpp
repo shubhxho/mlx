@@ -8,6 +8,7 @@
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/cpu/copy.h"
 #include "mlx/backend/cpu/encoder.h"
+#include "mlx/backend/cpu/threading.h"
 #include "mlx/dtype_utils.h"
 #include "mlx/primitives.h"
 
@@ -137,18 +138,23 @@ void sort(array& out, int axis) {
   auto axis_size = out.shape(axis);
 
   // Perform sorting in place
-  ContiguousIterator src_it(
-      remaining_shape, remaining_strides, remaining_shape.size());
+  // Rows are independent, so sort them in parallel.
   auto out_ptr = out.data<T>();
-  for (int i = 0; i < n_rows; i++) {
-    T* data_ptr = out_ptr + src_it.loc;
+  int64_t grain = std::max<int64_t>(4096 / std::max(axis_size, 1), 1);
+  cpu::parallel_for(n_rows, grain, [&](int64_t begin, int64_t end) {
+    ContiguousIterator src_it(
+        remaining_shape, remaining_strides, remaining_shape.size());
+    src_it.seek(begin);
+    for (int64_t i = begin; i < end; i++) {
+      T* data_ptr = out_ptr + src_it.loc;
 
-    StridedIterator st(data_ptr, axis_stride, 0);
-    StridedIterator ed(data_ptr, axis_stride, axis_size);
+      StridedIterator st(data_ptr, axis_stride, 0);
+      StridedIterator ed(data_ptr, axis_stride, axis_size);
 
-    std::stable_sort(st, ed, nan_aware_less<T>);
-    src_it.step();
-  }
+      std::stable_sort(st, ed, nan_aware_less<T>);
+      src_it.step();
+    }
+  });
 }
 
 template <typename T, typename IdxT = uint32_t>
@@ -174,44 +180,50 @@ void argsort(const array& in, array& out, int axis) {
   auto axis_size = in.shape(axis);
 
   // Perform sorting
-  ContiguousIterator in_it(
-      in_remaining_shape, in_remaining_strides, in_remaining_shape.size());
-  ContiguousIterator out_it(
-      out_remaining_shape, out_remaining_strides, out_remaining_shape.size());
+  // Rows are independent, so sort them in parallel.
   auto in_ptr = in.data<T>();
   auto out_ptr = out.data<IdxT>();
-  for (int i = 0; i < n_rows; i++) {
-    const T* data_ptr = in_ptr + in_it.loc;
-    IdxT* idx_ptr = out_ptr + out_it.loc;
+  int64_t grain = std::max<int64_t>(4096 / std::max(axis_size, 1), 1);
+  cpu::parallel_for(n_rows, grain, [&](int64_t begin, int64_t end) {
+    ContiguousIterator in_it(
+        in_remaining_shape, in_remaining_strides, in_remaining_shape.size());
+    ContiguousIterator out_it(
+        out_remaining_shape, out_remaining_strides, out_remaining_shape.size());
+    in_it.seek(begin);
+    out_it.seek(begin);
+    for (int64_t i = begin; i < end; i++) {
+      const T* data_ptr = in_ptr + in_it.loc;
+      IdxT* idx_ptr = out_ptr + out_it.loc;
 
-    in_it.step();
-    out_it.step();
+      in_it.step();
+      out_it.step();
 
-    StridedIterator st_(idx_ptr, out_stride, 0);
-    StridedIterator ed_(idx_ptr, out_stride, axis_size);
+      StridedIterator st_(idx_ptr, out_stride, 0);
+      StridedIterator ed_(idx_ptr, out_stride, axis_size);
 
-    // Initialize with iota
-    std::iota(st_, ed_, IdxT(0));
+      // Initialize with iota
+      std::iota(st_, ed_, IdxT(0));
 
-    // Sort according to vals
-    StridedIterator st(idx_ptr, out_stride, 0);
-    StridedIterator ed(idx_ptr, out_stride, axis_size);
+      // Sort according to vals
+      StridedIterator st(idx_ptr, out_stride, 0);
+      StridedIterator ed(idx_ptr, out_stride, axis_size);
 
-    std::stable_sort(st, ed, [data_ptr, in_stride](IdxT a, IdxT b) {
-      auto v1 = data_ptr[a * in_stride];
-      auto v2 = data_ptr[b * in_stride];
+      std::stable_sort(st, ed, [data_ptr, in_stride](IdxT a, IdxT b) {
+        auto v1 = data_ptr[a * in_stride];
+        auto v2 = data_ptr[b * in_stride];
 
-      // Handle NaNs (place them at the end)
-      if constexpr (is_floating_v<T>) {
-        if (std::isnan(v1))
-          return false;
-        if (std::isnan(v2))
-          return true;
-      }
+        // Handle NaNs (place them at the end)
+        if constexpr (is_floating_v<T>) {
+          if (std::isnan(v1))
+            return false;
+          if (std::isnan(v2))
+            return true;
+        }
 
-      return v1 < v2 || (v1 == v2 && a < b);
-    });
-  }
+        return v1 < v2 || (v1 == v2 && a < b);
+      });
+    }
+  });
 }
 
 template <typename T>
