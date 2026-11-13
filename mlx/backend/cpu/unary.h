@@ -5,6 +5,7 @@
 #include "mlx/backend/common/unary.h"
 #include "mlx/backend/cpu/encoder.h"
 #include "mlx/backend/cpu/simd/simd.h"
+#include "mlx/backend/cpu/threading.h"
 #include "mlx/utils.h"
 
 namespace mlx::core {
@@ -18,25 +19,36 @@ void unary_op(const T* a, U* out, size_t shape, size_t stride) {
 }
 
 template <typename T, typename U = T, typename Op>
+MLX_CPU_NOINLINE void unary_op_contiguous(const T* src, U* dst, int64_t size) {
+  constexpr int N = std::min(simd::max_size<T>, simd::max_size<U>);
+  while (size >= N) {
+    simd::store(dst, simd::Simd<U, N>(Op{}(simd::load<T, N>(src))));
+    size -= N;
+    src += N;
+    dst += N;
+  }
+  while (size > 0) {
+    *dst = Op{}(*src);
+    size--;
+    dst++;
+    src++;
+  }
+}
+
+template <typename T, typename U = T, typename Op>
 void unary_op(const array& a, array& out, Op) {
   const T* src = a.data<T>();
   U* dst = out.data<U>();
   auto ndim = a.ndim();
   if (a.flags().contiguous) {
-    auto size = a.data_size();
-    constexpr int N = std::min(simd::max_size<T>, simd::max_size<U>);
-    while (size >= N) {
-      simd::store(dst, simd::Simd<U, N>(Op{}(simd::load<T, N>(src))));
-      size -= N;
-      src += N;
-      dst += N;
-    }
-    while (size > 0) {
-      *dst = Op{}(*src);
-      size--;
-      dst++;
-      src++;
-    }
+    int64_t size = a.data_size();
+    cpu::parallel_for(
+        size,
+        cpu::elementwise_grain<
+            std::conditional_t<(sizeof(T) > sizeof(U)), T, U>>(),
+        [&](int64_t begin, int64_t end) {
+          unary_op_contiguous<T, U, Op>(src + begin, dst + begin, end - begin);
+        });
   } else {
     size_t shape = ndim > 0 ? a.shape().back() : 1;
     size_t stride = ndim > 0 ? a.strides().back() : 1;
@@ -44,11 +56,17 @@ void unary_op(const array& a, array& out, Op) {
       unary_op<T, U, Op>(src, dst, shape, stride);
       return;
     }
-    auto it = ContiguousIterator(a.shape(), a.strides(), ndim - 1);
-    for (size_t elem = 0; elem < a.size(); elem += shape) {
-      unary_op<T, U, Op>(src + it.loc, dst + elem, shape, stride);
-      it.step();
-    }
+    int64_t n_rows = a.size() / shape;
+    int64_t grain = std::max<int64_t>(
+        cpu::elementwise_grain<T>() / std::max<size_t>(shape, 1), 1);
+    cpu::parallel_for(n_rows, grain, [&](int64_t begin, int64_t end) {
+      auto it = ContiguousIterator(a.shape(), a.strides(), ndim - 1);
+      it.seek(begin);
+      for (int64_t r = begin; r < end; ++r) {
+        unary_op<T, U, Op>(src + it.loc, dst + r * shape, shape, stride);
+        it.step();
+      }
+    });
   }
 }
 
