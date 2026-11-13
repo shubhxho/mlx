@@ -9,6 +9,7 @@
 
 #include "mlx/backend/cpu/encoder.h"
 #include "mlx/backend/cpu/simd/simd.h"
+#include "mlx/backend/cpu/threading.h"
 
 namespace mlx::core {
 
@@ -156,6 +157,8 @@ void binary_op(const array& a, const array& b, array& out, BinaryOpType bopt) {
   auto b_ptr = b.data<T>();
 
   auto out_ptr = out.data<U>();
+  constexpr int64_t elementwise_grain = cpu::elementwise_grain<
+      std::conditional_t<(sizeof(T) > sizeof(U)), T, U>>();
   if (bopt == BinaryOpType::ScalarScalar) {
     *out_ptr = Op{}(*a_ptr, *b_ptr);
     return;
@@ -163,19 +166,31 @@ void binary_op(const array& a, const array& b, array& out, BinaryOpType bopt) {
 
   // The full computation is scalar vector so delegate to the op
   if (bopt == BinaryOpType::ScalarVector) {
-    ScalarVector<Op>{}(a_ptr, b_ptr, out_ptr, b.data_size());
+    cpu::parallel_for(
+        b.data_size(), elementwise_grain, [&](int64_t begin, int64_t end) {
+          ScalarVector<Op>{}(
+              a_ptr, b_ptr + begin, out_ptr + begin, end - begin);
+        });
     return;
   }
 
   // The full computation is vector scalar so delegate to the op
   if (bopt == BinaryOpType::VectorScalar) {
-    VectorScalar<Op>{}(a_ptr, b_ptr, out_ptr, a.data_size());
+    cpu::parallel_for(
+        a.data_size(), elementwise_grain, [&](int64_t begin, int64_t end) {
+          VectorScalar<Op>{}(
+              a_ptr + begin, b_ptr, out_ptr + begin, end - begin);
+        });
     return;
   }
 
   // The full computation is vector vector so delegate to the op
   if (bopt == BinaryOpType::VectorVector) {
-    VectorVector<Op>{}(a_ptr, b_ptr, out_ptr, a.size());
+    cpu::parallel_for(
+        a.size(), elementwise_grain, [&](int64_t begin, int64_t end) {
+          VectorVector<Op>{}(
+              a_ptr + begin, b_ptr + begin, out_ptr + begin, end - begin);
+        });
     return;
   }
 
@@ -234,56 +249,70 @@ void binary_op(const array& a, const array& b, array& out, BinaryOpType bopt) {
     dim = ndim;
   }
 
-  switch (bopt) {
-    case BinaryOpType::VectorVector:
-      binary_op_dispatch_dims<T, U, true, VectorVector<Op>>(
-          a_ptr,
-          b_ptr,
-          out_ptr,
-          dim,
-          a.size(),
-          new_shape,
-          a_strides,
-          b_strides,
-          strides);
-      break;
-    case BinaryOpType::VectorScalar:
-      binary_op_dispatch_dims<T, U, true, VectorScalar<Op>>(
-          a_ptr,
-          b_ptr,
-          out_ptr,
-          dim,
-          a.size(),
-          new_shape,
-          a_strides,
-          b_strides,
-          strides);
-      break;
-    case BinaryOpType::ScalarVector:
-      binary_op_dispatch_dims<T, U, true, ScalarVector<Op>>(
-          a_ptr,
-          b_ptr,
-          out_ptr,
-          dim,
-          a.size(),
-          new_shape,
-          a_strides,
-          b_strides,
-          strides);
-      break;
-    default:
-      binary_op_dispatch_dims<T, U, false, Op>(
-          a_ptr,
-          b_ptr,
-          out_ptr,
-          dim,
-          a.size(),
-          new_shape,
-          a_strides,
-          b_strides,
-          strides);
-      break;
-  }
+  // Split the outermost (collapsed) axis across threads.
+  int64_t total = a.size();
+  int64_t outer = new_shape[0];
+  int64_t inner_size = outer > 0 ? total / outer : 0;
+  int64_t grain = std::max<int64_t>(
+      elementwise_grain / std::max<int64_t>(inner_size, 1), 1);
+  cpu::parallel_for(outer, grain, [&](int64_t begin, int64_t end) {
+    auto a_ptr_ = a_ptr + begin * a_strides[0];
+    auto b_ptr_ = b_ptr + begin * b_strides[0];
+    auto out_ptr_ = out_ptr + begin * strides[0];
+    Shape shape_ = new_shape;
+    shape_[0] = end - begin;
+    int64_t size_ = (end - begin) * inner_size;
+    switch (bopt) {
+      case BinaryOpType::VectorVector:
+        binary_op_dispatch_dims<T, U, true, VectorVector<Op>>(
+            a_ptr_,
+            b_ptr_,
+            out_ptr_,
+            dim,
+            size_,
+            shape_,
+            a_strides,
+            b_strides,
+            strides);
+        break;
+      case BinaryOpType::VectorScalar:
+        binary_op_dispatch_dims<T, U, true, VectorScalar<Op>>(
+            a_ptr_,
+            b_ptr_,
+            out_ptr_,
+            dim,
+            size_,
+            shape_,
+            a_strides,
+            b_strides,
+            strides);
+        break;
+      case BinaryOpType::ScalarVector:
+        binary_op_dispatch_dims<T, U, true, ScalarVector<Op>>(
+            a_ptr_,
+            b_ptr_,
+            out_ptr_,
+            dim,
+            size_,
+            shape_,
+            a_strides,
+            b_strides,
+            strides);
+        break;
+      default:
+        binary_op_dispatch_dims<T, U, false, Op>(
+            a_ptr_,
+            b_ptr_,
+            out_ptr_,
+            dim,
+            size_,
+            shape_,
+            a_strides,
+            b_strides,
+            strides);
+        break;
+    }
+  });
 }
 
 template <typename T, typename Op>
