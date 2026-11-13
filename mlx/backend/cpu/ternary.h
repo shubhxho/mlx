@@ -5,6 +5,7 @@
 #include "mlx/backend/common/ternary.h"
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/cpu/encoder.h"
+#include "mlx/backend/cpu/threading.h"
 
 namespace mlx::core {
 
@@ -136,18 +137,35 @@ void ternary_op(
   if (topt == TernaryOpType::ScalarScalarScalar) {
     *out_ptr = op(*a_ptr, *b_ptr, *c_ptr);
   } else if (topt == TernaryOpType::VectorVectorVector) {
-    for (size_t i = 0; i < out.size(); ++i) {
-      *out_ptr = op(*a_ptr, *b_ptr, *c_ptr);
-      a_ptr++;
-      b_ptr++;
-      c_ptr++;
-      out_ptr++;
-    }
+    cpu::parallel_for(
+        out.size(),
+        cpu::elementwise_grain<U>(),
+        [&](int64_t begin, int64_t end) {
+          for (int64_t i = begin; i < end; ++i) {
+            out_ptr[i] = op(a_ptr[i], b_ptr[i], c_ptr[i]);
+          }
+        });
   } else {
     auto [shape, strides] = collapse_contiguous_dims(
         a.shape(), {a.strides(), b.strides(), c.strides(), out.strides()});
-    ternary_op_dispatch_dims<T1, T2, T3, U>(
-        a_ptr, b_ptr, c_ptr, out_ptr, op, out.size(), shape, strides);
+    // Split the outermost (collapsed) axis across threads.
+    int64_t outer = shape[0];
+    int64_t inner_size = outer > 0 ? out.size() / outer : 0;
+    int64_t grain = std::max<int64_t>(
+        cpu::elementwise_grain<U>() / std::max<int64_t>(inner_size, 1), 1);
+    cpu::parallel_for(outer, grain, [&](int64_t begin, int64_t end) {
+      Shape shape_ = shape;
+      shape_[0] = end - begin;
+      ternary_op_dispatch_dims<T1, T2, T3, U>(
+          a_ptr + begin * strides[0][0],
+          b_ptr + begin * strides[1][0],
+          c_ptr + begin * strides[2][0],
+          out_ptr + begin * strides[3][0],
+          op,
+          (end - begin) * inner_size,
+          shape_,
+          strides);
+    });
   }
 }
 
