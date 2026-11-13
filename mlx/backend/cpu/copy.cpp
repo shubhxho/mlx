@@ -7,6 +7,7 @@
 #include "mlx/backend/cpu/copy.h"
 #include "mlx/backend/cpu/encoder.h"
 #include "mlx/backend/cpu/simd/simd.h"
+#include "mlx/backend/cpu/threading.h"
 
 namespace mlx::core {
 
@@ -16,17 +17,24 @@ template <typename SrcT, typename DstT>
 void copy_single(const array& src, array& dst) {
   auto src_ptr = src.data<SrcT>();
   auto dst_ptr = dst.data<DstT>();
-  auto size = dst.size();
+  int64_t size = dst.size();
   auto val = static_cast<DstT>(src_ptr[0]);
-  std::fill_n(dst_ptr, size, val);
+  cpu::parallel_for(
+      size, cpu::elementwise_grain<DstT>(), [&](int64_t begin, int64_t end) {
+        std::fill_n(dst_ptr + begin, end - begin, val);
+      });
 }
 
 template <typename SrcT, typename DstT>
 void copy_vector(const array& src, array& dst) {
   auto src_ptr = src.data<SrcT>();
   auto dst_ptr = dst.data<DstT>();
-  auto size = src.data_size();
-  std::copy(src_ptr, src_ptr + size, dst_ptr);
+  int64_t size = src.data_size();
+  constexpr int64_t grain = cpu::elementwise_grain<
+      std::conditional_t<(sizeof(SrcT) > sizeof(DstT)), SrcT, DstT>>();
+  cpu::parallel_for(size, grain, [&](int64_t begin, int64_t end) {
+    std::copy(src_ptr + begin, src_ptr + end, dst_ptr + begin);
+  });
 }
 
 template <typename SrcT, typename DstT, int D>
@@ -50,6 +58,32 @@ inline void copy_dims(
     }
     src += stride_src;
     dst += stride_dst;
+  }
+}
+
+// Tile size (in elements) for transpose-like copies.
+constexpr int64_t kCopyTile = 32;
+
+// dst[i * d_m + j] = src[i * s_m + j * s_n] for i < M, j < N, processed in
+// kCopyTile x kCopyTile tiles.
+template <typename SrcT, typename DstT>
+inline void copy_2d_tiled(
+    const SrcT* src,
+    DstT* dst,
+    int64_t M,
+    int64_t N,
+    int64_t s_m,
+    int64_t s_n,
+    int64_t d_m) {
+  for (int64_t j0 = 0; j0 < N; j0 += kCopyTile) {
+    int64_t j1 = std::min(j0 + kCopyTile, N);
+    for (int64_t i = 0; i < M; ++i) {
+      const SrcT* s = src + i * s_m;
+      DstT* d = dst + i * d_m;
+      for (int64_t j = j0; j < j1; ++j) {
+        d[j] = static_cast<DstT>(s[j * s_n]);
+      }
+    }
   }
 }
 
@@ -77,28 +111,6 @@ void copy_general_general(
   }
   auto [shape, strides] =
       collapse_contiguous_dims(data_shape, {i_strides, o_strides});
-
-  int ndim = shape.size();
-  if (ndim < 3) {
-    if (i_offset_ptr) {
-      src_ptr += i_offset_ptr[0];
-    }
-    if (o_offset_ptr) {
-      dst_ptr += o_offset_ptr[0];
-    }
-
-    if (ndim == 1) {
-      copy_dims<SrcT, DstT, 1>(
-          src_ptr, dst_ptr, shape, strides[0], strides[1], 0);
-    } else if (ndim == 2) {
-      copy_dims<SrcT, DstT, 2>(
-          src_ptr, dst_ptr, shape, strides[0], strides[1], 0);
-    } else if (ndim == 3) {
-      copy_dims<SrcT, DstT, 3>(
-          src_ptr, dst_ptr, shape, strides[0], strides[1], 0);
-    }
-    return;
-  }
   if (i_offset_ptr) {
     src_ptr += i_offset_ptr[0];
   }
@@ -106,23 +118,103 @@ void copy_general_general(
     dst_ptr += o_offset_ptr[0];
   }
 
-  auto size = std::accumulate(
+  int ndim = shape.size();
+  int64_t size = std::accumulate(
       shape.begin(), shape.end(), int64_t{1}, std::multiplies<int64_t>());
-  ContiguousIterator in(shape, strides[0], ndim - 3);
-  ContiguousIterator out(shape, strides[1], ndim - 3);
-  auto stride = std::accumulate(
-      shape.end() - 3, shape.end(), 1, std::multiplies<int64_t>());
-  for (int64_t elem = 0; elem < size; elem += stride) {
-    copy_dims<SrcT, DstT, 3>(
-        src_ptr + in.loc,
-        dst_ptr + out.loc,
-        shape,
-        strides[0],
-        strides[1],
-        ndim - 3);
-    in.step();
-    out.step();
+  if (size == 0) {
+    return;
   }
+  constexpr int64_t grain = cpu::elementwise_grain<
+      std::conditional_t<(sizeof(SrcT) > sizeof(DstT)), SrcT, DstT>>();
+
+  // Transpose-like copy: the innermost destination axis is contiguous but
+  // the source walks it with a large stride, while the next axis is
+  // contiguous in the source. Copy in square tiles so both sides stay in
+  // cache instead of touching a new source cache line per element.
+  if (ndim >= 2 && strides[1][ndim - 1] == 1 && strides[0][ndim - 2] == 1 &&
+      strides[0][ndim - 1] >= 16) {
+    int64_t M = shape[ndim - 2];
+    int64_t N = shape[ndim - 1];
+    int64_t s_m = strides[0][ndim - 2];
+    int64_t s_n = strides[0][ndim - 1];
+    int64_t d_m = strides[1][ndim - 2];
+    int64_t outer = size / (M * N);
+    int64_t n_blocks = (M + kCopyTile - 1) / kCopyTile;
+    int64_t work_grain =
+        std::max<int64_t>(grain / std::max<int64_t>(kCopyTile * N, 1), 1);
+    cpu::parallel_for(
+        outer * n_blocks, work_grain, [&](int64_t begin, int64_t end) {
+          ContiguousIterator in(shape, strides[0], ndim - 2);
+          ContiguousIterator out(shape, strides[1], ndim - 2);
+          int64_t slab = begin / n_blocks;
+          in.seek(slab);
+          out.seek(slab);
+          for (int64_t w = begin; w < end; ++w) {
+            int64_t s = w / n_blocks;
+            if (s != slab) {
+              in.step();
+              out.step();
+              slab = s;
+            }
+            int64_t m0 = (w % n_blocks) * kCopyTile;
+            int64_t m1 = std::min(m0 + kCopyTile, M);
+            copy_2d_tiled(
+                src_ptr + in.loc + m0 * s_m,
+                dst_ptr + out.loc + m0 * d_m,
+                m1 - m0,
+                N,
+                s_m,
+                s_n,
+                d_m);
+          }
+        });
+    return;
+  }
+
+  if (ndim < 3) {
+    int64_t outer = shape[0];
+    int64_t inner = size / outer;
+    cpu::parallel_for(
+        outer,
+        std::max<int64_t>(grain / std::max<int64_t>(inner, 1), 1),
+        [&](int64_t begin, int64_t end) {
+          Shape shape_ = shape;
+          shape_[0] = end - begin;
+          auto s = src_ptr + begin * strides[0][0];
+          auto d = dst_ptr + begin * strides[1][0];
+          if (ndim == 1) {
+            copy_dims<SrcT, DstT, 1>(s, d, shape_, strides[0], strides[1], 0);
+          } else {
+            copy_dims<SrcT, DstT, 2>(s, d, shape_, strides[0], strides[1], 0);
+          }
+        });
+    return;
+  }
+
+  // Iterate over the leading ndim - 3 axes and copy 3D blocks.
+  int64_t block = std::accumulate(
+      shape.end() - 3, shape.end(), int64_t{1}, std::multiplies<int64_t>());
+  int64_t n_outer = size / block;
+  cpu::parallel_for(
+      n_outer,
+      std::max<int64_t>(grain / std::max<int64_t>(block, 1), 1),
+      [&](int64_t begin, int64_t end) {
+        ContiguousIterator in(shape, strides[0], ndim - 3);
+        ContiguousIterator out(shape, strides[1], ndim - 3);
+        in.seek(begin);
+        out.seek(begin);
+        for (int64_t i = begin; i < end; ++i) {
+          copy_dims<SrcT, DstT, 3>(
+              src_ptr + in.loc,
+              dst_ptr + out.loc,
+              shape,
+              strides[0],
+              strides[1],
+              ndim - 3);
+          in.step();
+          out.step();
+        }
+      });
 }
 
 template <typename SrcT, typename DstT>
