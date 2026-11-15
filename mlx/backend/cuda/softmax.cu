@@ -39,13 +39,23 @@ __global__ void softmax(const T* in, T* out, int axis_size) {
   cg::greater<AccT> max_op;
   cg::plus<AccT> plus_op;
 
+  // When the whole row fits in a single pass (always the case for
+  // axis_size <= 1024 * N_READS), keep this thread's values in registers so
+  // the output pass does not read the row from global memory a second time.
+  const int n_iters = cuda::ceil_div(axis_size, BLOCK_DIM * N_READS);
+  const bool single_pass = n_iters == 1;
+  AlignedVector<T, N_READS> cached;
+
   // Thread reduce.
   AccT prevmax;
   AccT maxval = Limits<AccT>::finite_min();
   AccT normalizer = cast_to<AccT>(0);
-  for (int r = 0; r < cuda::ceil_div(axis_size, BLOCK_DIM * N_READS); r++) {
+  for (int r = 0; r < n_iters; r++) {
     auto index = r * BLOCK_DIM + block.thread_rank();
     auto vals = load_vector<N_READS>(in, index, axis_size, Limits<T>::min());
+    if (single_pass) {
+      cached = vals;
+    }
     prevmax = maxval;
 #pragma unroll
     for (int i = 0; i < N_READS; ++i) {
@@ -93,9 +103,13 @@ __global__ void softmax(const T* in, T* out, int axis_size) {
   normalizer = 1 / normalizer;
 
   // Write output.
-  for (int r = 0; r < cuda::ceil_div(axis_size, BLOCK_DIM * N_READS); r++) {
+  for (int r = 0; r < n_iters; r++) {
     auto index = r * BLOCK_DIM + block.thread_rank();
-    auto vals = load_vector<N_READS>(in, index, axis_size, T(0));
+    // Out-of-range lanes of `cached` hold -inf; store_vector never writes
+    // them, so they do not need to be reset.
+    auto vals =
+        single_pass ? cached : load_vector<N_READS>(in, index, axis_size, T(0));
+#pragma unroll
     for (int i = 0; i < N_READS; i++) {
       vals[i] = softmax_exp(static_cast<AccT>(vals[i]) - maxval) * normalizer;
     }
