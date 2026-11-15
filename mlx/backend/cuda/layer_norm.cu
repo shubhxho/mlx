@@ -68,11 +68,22 @@ __global__ void layer_norm(
   x += grid.block_rank() * axis_size;
   out += grid.block_rank() * axis_size;
 
+  // When the whole row fits in a single pass (always the case for
+  // axis_size <= 1024 * N_READS, e.g. hidden sizes up to 4096 in float32 or
+  // 8192 in float16/bfloat16), keep this thread's values in registers. The
+  // row is then read from global memory once instead of three times.
+  const int n_iters = cuda::ceil_div(axis_size, BLOCK_DIM * N_READS);
+  const bool single_pass = n_iters == 1;
+  AlignedVector<T, N_READS> cached;
+
   // Sum.
   float sum = 0;
-  for (int r = 0; r < cuda::ceil_div(axis_size, BLOCK_DIM * N_READS); ++r) {
+  for (int r = 0; r < n_iters; ++r) {
     auto index = r * BLOCK_DIM + block.thread_rank();
     auto xn = load_vector<N_READS>(x, index, axis_size, T(0));
+    if (single_pass) {
+      cached = xn;
+    }
 #pragma unroll
     for (int i = 0; i < N_READS; ++i) {
       sum += static_cast<float>(xn[i]);
@@ -85,7 +96,19 @@ __global__ void layer_norm(
 
   // Normalizer.
   float normalizer = 0;
-  for (int r = 0; r < cuda::ceil_div(axis_size, BLOCK_DIM * N_READS); ++r) {
+  if (single_pass) {
+    // Out-of-range lanes of `cached` hold 0, which is not 0 after subtracting
+    // the mean, so they have to be masked out here.
+    int base = block.thread_rank() * N_READS;
+#pragma unroll
+    for (int i = 0; i < N_READS; ++i) {
+      if (base + i < axis_size) {
+        float t = static_cast<float>(cached[i]) - mean;
+        normalizer += t * t;
+      }
+    }
+  }
+  for (int r = 0; !single_pass && r < n_iters; ++r) {
     auto index = r * BLOCK_DIM + block.thread_rank();
     if ((index + 1) * N_READS <= axis_size) {
       auto xn = load_vector<N_READS>(x, index);
@@ -105,9 +128,10 @@ __global__ void layer_norm(
   normalizer = rsqrt(normalizer / axis_size + eps);
 
   // Outputs.
-  for (int r = 0; r < cuda::ceil_div(axis_size, BLOCK_DIM * N_READS); ++r) {
+  for (int r = 0; r < n_iters; ++r) {
     auto index = r * BLOCK_DIM + block.thread_rank();
-    auto xn = load_vector<N_READS>(x, index, axis_size, T(0));
+    auto xn =
+        single_pass ? cached : load_vector<N_READS>(x, index, axis_size, T(0));
     auto wn = load_vector<N_READS>(w, index, axis_size, w_stride, T(0));
     auto bn = load_vector<N_READS>(b, index, axis_size, b_stride, T(0));
 #pragma unroll
